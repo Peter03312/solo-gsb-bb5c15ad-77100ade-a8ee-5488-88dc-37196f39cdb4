@@ -5,10 +5,16 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+import secrets
+from contextlib import asynccontextmanager
+from typing import Any
+
+from anyio import to_thread
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from . import publishing
 from .redaction import (
     Edit,
     Fragment,
@@ -19,14 +25,26 @@ from .redaction import (
     select_fragments_with_budget,
 )
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # 启动时确保凭证表存在（幂等）。
+    publishing.init_db()
+    yield
+
+
 app = FastAPI(
     title="敏感片段遮盖 API",
-    version="1.2.0",
+    version="1.3.0",
+    lifespan=lifespan,
     description=(
         "提交原文及候选片段（含唯一 ID、正整数权重、左闭右开码点区间），"
         "返回互不重叠的最优入选组合、落选 ID 与等长遮盖文本。"
         "支持按码点区间编辑修订原文：作废旧片段、迁移保留片段后再选择遮盖；"
         "也支持通过 /redact/budget 限定遮盖码点总预算。"
+        "POST /redact/publish 可发布脱敏凭证：仅持久化遮盖正文、入选区间与"
+        "加盐原文摘要（不保存原文），凭证串成 SHA-256 哈希链，"
+        "可经 /redact/publish/{id}/verify 凭客户端留存的链值核验。"
     ),
 )
 
@@ -155,6 +173,10 @@ REVISE_REQUEST_SCHEMA = {
 }
 
 
+# /redact/publish 的请求体与 /redact 相同（text + fragments）；
+# 复用 REDACT_REQUEST_SCHEMA 在 /docs 展示相同的请求结构。
+
+
 class RedactOut(BaseModel):
     selected_ids: list[int | str] = Field(..., description="入选片段 ID（升序）")
     rejected_ids: list[int | str] = Field(..., description="落选片段 ID（升序）")
@@ -182,6 +204,29 @@ class ReviseOut(BaseModel):
         ..., description="保留片段中落选的 ID（升序，不含作废）"
     )
     masked_text: str = Field(..., description="修订后正文中入选片段以等长 █ 遮盖的结果")
+
+
+class PublishOut(BaseModel):
+    credential_id: int = Field(..., description="凭证编号，从 1 开始连续递增")
+    selected_ids: list[int | str] = Field(..., description="入选片段 ID（升序）")
+    masked_text: str = Field(..., description="入选片段以等长 █ 遮盖后的正文（已持久化）")
+    chain_value: str = Field(
+        ..., description="本凭证链值（64 位十六进制 SHA-256），由客户端留存用于核验"
+    )
+
+
+class VerifyOut(BaseModel):
+    credential_id: int = Field(..., description="被核验的凭证编号")
+    valid: bool = Field(..., description="链完整且与客户端留存链值一致时为 true")
+    first_broken_id: int | None = Field(
+        ..., description="首个断裂编号；无断裂时为 null"
+    )
+    chain_value_matches: bool = Field(
+        ..., description="重算所得链值（断裂时为库存链值）是否等于客户端留存链值"
+    )
+    server_chain_value: str = Field(
+        ..., description="服务端截至该凭证的链值（重算结果或当前库存值）"
+    )
 
 
 def _bad(message: str) -> ValueError:
@@ -475,3 +520,97 @@ async def revise(request: Request) -> ReviseOut:
         rejected_ids=sorted(f.id for f in kept if f.id not in selected_set),
         masked_text=masked,
     )
+
+
+@app.post(
+    "/redact/publish",
+    response_model=PublishOut,
+    tags=["脱敏发布凭证"],
+    summary="按 /redact 规则遮盖并发布脱敏凭证（哈希链）",
+    openapi_extra={"requestBody": {"content": {"application/json": {"schema": REDACT_REQUEST_SCHEMA}}}},
+)
+async def publish(request: Request) -> PublishOut:
+    # text / fragments 的校验与选段规则与 POST /redact 完全一致。
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise _bad("请求体不是合法的 JSON")
+    text, fragments = validate_payload(payload)
+
+    selected = select_fragments(fragments)
+    by_id = {f.id: f for f in fragments}
+    chosen = [by_id[fragment_id] for fragment_id in selected]
+    masked = mask_text(text, chosen)
+
+    # 仅持久化：遮盖正文、入选码点区间、带随机盐的原文摘要；原文不入库。
+    # SQLite 事务（BEGIN IMMEDIATE）在工作线程中同步执行，
+    # 保证并发请求的编号与链顺序一致。
+    ranges = [(frag.start, frag.end) for frag in chosen]
+    text_digest = publishing.salted_text_digest(text)
+    credential = await to_thread.run_sync(
+        publishing.publish_credential, masked, ranges, text_digest
+    )
+    return PublishOut(
+        credential_id=credential.seq,
+        selected_ids=list(selected),
+        masked_text=credential.masked_text,
+        chain_value=credential.chain_value,
+    )
+
+
+@app.get(
+    "/redact/publish/{credential_id}/verify",
+    response_model=VerifyOut,
+    tags=["脱敏发布凭证"],
+    summary="凭客户端留存的链值核验截至指定凭证的哈希链",
+)
+async def verify_published(
+    credential_id: int,
+    chain_value: str | None = Query(
+        default=None,
+        description="发布时客户端留存的该凭证链值（64 位十六进制 SHA-256）",
+    ),
+) -> VerifyOut:
+    if chain_value is None:
+        raise _bad("缺少查询参数：chain_value")
+    if not _is_hex64(chain_value):
+        raise _bad("chain_value 必须是 64 位小写十六进制 SHA-256 摘要")
+
+    credential = await to_thread.run_sync(publishing.get_credential, credential_id)
+    if credential is None:
+        raise HTTPException(status_code=404, detail="凭证不存在")
+
+    records = await to_thread.run_sync(
+        publishing.list_credentials_through, credential_id
+    )
+    broken = publishing.first_chain_break(records, credential_id)
+    # 链断裂时无法按链重算出有意义的尾链值，直接返回库存尾链值供排查。
+    server_chain_value = (
+        credential.chain_value if broken is not None else records[-1].chain_value
+    )
+    chain_value_matches = (
+        broken is None
+        and _equal_hex_digest(server_chain_value, chain_value)
+    )
+    return VerifyOut(
+        credential_id=credential_id,
+        valid=chain_value_matches,
+        first_broken_id=broken,
+        chain_value_matches=chain_value_matches,
+        server_chain_value=server_chain_value,
+    )
+
+
+def _is_hex64(value: str) -> bool:
+    """``value`` 是否为 64 位小写十六进制字符串（与 sha256().hexdigest() 同形）。"""
+    return (
+        len(value) == 64
+        and all(
+            ("0" <= char <= "9") or ("a" <= char <= "f") for char in value
+        )
+    )
+
+
+def _equal_hex_digest(left: str, right: str) -> bool:
+    """恒定时间比较两个十六进制摘要，避免核验接口的计时侧信道。"""
+    return secrets.compare_digest(left, right)

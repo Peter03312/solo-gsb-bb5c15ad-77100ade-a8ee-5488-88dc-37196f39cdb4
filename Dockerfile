@@ -13,10 +13,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 再拷贝应用代码
 COPY app ./app
 
+# 凭证 SQLite 数据库的持久化目录（由 compose 命名卷挂载）
+RUN mkdir -p /data
+
 # 以非 root 用户运行
 RUN useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app
+    && chown -R appuser:appuser /app /data
 USER appuser
+
+ENV REDACTION_DB_PATH=/data/redaction.db
 
 EXPOSE 8000
 

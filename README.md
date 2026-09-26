@@ -4,8 +4,12 @@
 **互不重叠**的前提下选出最优片段组合，并用等长的 `█`（U+2588 FULL BLOCK）
 遮盖原文。片段之间允许重叠（提交时无需预处理），相邻片段可同时入选。
 另提供 `POST /redact/revise`：先按码点区间编辑修订原文，自动作废旧片段、
-迁移保留片段，再完成选择与遮盖；以及 `POST /redact/budget`：在给定的
-遮盖码点总预算内选择最优组合。
+迁移保留片段，再完成选择与遮盖；`POST /redact/budget`：在给定的
+遮盖码点总预算内选择最优组合；以及 `POST /redact/publish`：按与
+`POST /redact` 相同的校验与选段规则发布**脱敏凭证**，仅持久化遮盖正文、
+入选区间与带随机盐的原文 SHA-256 摘要（**不保存原文**），凭证串成
+SHA-256 哈希链，客户端留存链值后可随时经
+`GET /redact/publish/{id}/verify` 核验档案是否被改动。
 
 ## 一条命令启动
 
@@ -23,6 +27,17 @@ docker compose up --build
 - OpenAPI 描述：`http://localhost:8000/openapi.json`
 
 后台运行可加 `-d`，停止使用 `docker compose down`。
+
+访问端口固定为宿主机 **8000**（`http://localhost:8000`）。
+脱敏凭证写入 SQLite 数据库并保存在 Docker **命名卷 `redaction-data`**
+（容器内 `/data/redaction.db`）中：`docker compose down`、重建镜像、
+重启容器都不会丢失凭证链；仅当显式删除卷
+（`docker compose down -v`）时才会清空。
+
+> **凭证留存（重要）**：每次发布返回的 `chain_value` 是该凭证的哈希链值，
+> 服务端不会替你另行备份。请在发布成功后**立即由客户端自行保存**
+> `credential_id` 与 `chain_value`（例如写入自己的台账），日后核验时
+> 原样传回即可。无需保存原文——服务端本来就不保存原文，只保存加盐摘要。
 
 ## API
 
@@ -296,6 +311,102 @@ curl -s http://localhost:8000/redact/revise \
 删除区间 `[2,4)` 与片段 1（`[1,3)`）相交，片段 1 作废；片段 2（`[4,6)`）
 在删除之后，整体左移 2 个码点至 `[2,4)`，遮盖修订后文本中的 `"ef"`。
 
+### `POST /redact/publish`
+
+按与 `POST /redact` **完全相同**的 `text`、`fragments` 校验与选段规则
+完成选择与遮盖，并把结果作为**脱敏发布凭证**持久化。请求体与
+`POST /redact` 相同（仅需 `text` 与 `fragments`），校验失败同样返回 HTTP 400。
+
+凭证**只持久化**以下内容，原文不入库：
+
+| 持久化内容 | 说明 |
+| --- | --- |
+| 遮盖正文 `masked_text` | 入选片段等长 `█` 遮盖后的正文 |
+| 入选区间 `ranges` | 入选片段的 `[start, end)` 码点区间，按起点升序 |
+| 原文摘要 `text_digest` | `"<随机盐 hex>$<sha256(盐 || 原文 UTF-8) hex>"`；随机盐（32 字节）保证相同原文摘要也不重复，无法据此反查常见原文 |
+| 凭证编号 `seq` | 从 1 开始连续递增 |
+| 链值 `chain_value` | 见下文哈希链规则 |
+
+返回体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `credential_id` | 凭证编号（从 1 开始连续递增） |
+| `selected_ids` | 入选片段 ID，按升序排列 |
+| `masked_text` | 遮盖正文（与 `POST /redact` 的结果一致） |
+| `chain_value` | 本凭证链值，64 位十六进制 SHA-256；**客户端需自行留存** |
+
+哈希链规则：第一条凭证的前一链值为 64 个 `0`（创世链值）；每条新凭证的
+链值为对“规范化凭证内容 + 前一链值”取 SHA-256。规范化内容为固定字段集合
+（编号、遮盖正文、入选区间、原文摘要、前一链值）的紧凑 UTF-8 JSON
+（键排序、无空白、非 ASCII 直出），任何实现都能重算出同一结果。
+
+编号分配与链值写入在单条 SQLite 事务（`BEGIN IMMEDIATE` 立即写锁，
+配合 30 秒忙等待）中完成，并发请求严格串行排队，编号连续、链顺序一致。
+
+#### 示例
+
+```bash
+curl -s http://localhost:8000/redact/publish \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "你好，世界！",
+    "fragments": [
+      {"id": 1, "weight": 5, "start": 0, "end": 3},
+      {"id": 2, "weight": 3, "start": 0, "end": 2}
+    ]
+  }'
+```
+
+响应（`chain_value` 因随机盐每次不同）：
+
+```json
+{
+  "credential_id": 1,
+  "selected_ids": [1],
+  "masked_text": "███世界！",
+  "chain_value": "d47320fae8f27cbfea41b6528c6215e790d5fe6b26f9d5e3bb949ff63a778b8a"
+}
+```
+
+### `GET /redact/publish/{id}/verify`
+
+凭客户端发布时留存的链值，重算从第 1 条到第 `id` 条的全部凭证记录，
+核验哈希链是否完整、尾链值是否与留存值一致。
+
+查询参数：
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `chain_value` | string | **必填**，发布时留存的该凭证链值（64 位小写十六进制）；缺失或格式错误返回 HTTP 400 |
+
+路径参数 `id` 不存在时返回 HTTP 404。
+
+返回体（HTTP 200）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `credential_id` | 被核验的凭证编号 |
+| `valid` | 链完整（无断裂）且服务端重算链值等于客户端留存链值时为 `true` |
+| `first_broken_id` | 首个断裂编号（记录缺失/不连续，或该记录重算链值与库存不符）；无断裂为 `null` |
+| `chain_value_matches` | 服务端链值是否与客户端留存链值一致 |
+| `server_chain_value` | 服务端截至该凭证的链值；链断裂时为当前库存尾链值，便于排查 |
+
+示例：
+
+```bash
+curl -s 'http://localhost:8000/redact/publish/1/verify?chain_value=d47320fae8f27cbfea41b6528c6215e790d5fe6b26f9d5e3bb949ff63a778b8a'
+# {"credential_id":1,"valid":true,"first_broken_id":null,
+#  "chain_value_matches":true,"server_chain_value":"d473...778b8a"}
+```
+
+注意两种不同的“不通过”：
+
+- 留存链值写错、但服务端档案本身完整：`valid=false`、
+  `first_broken_id=null`、`chain_value_matches=false`；
+- 服务端档案被改动或缺失：`valid=false`，`first_broken_id` 指向
+  **首个**出问题的编号；断裂点之前的旧凭证仍可单独核验通过。
+
 ## 码点计数说明
 
 位置与遮盖均以 **Unicode 码点**为单位（即 Python 3 中 `str` 的索引与
@@ -316,8 +427,13 @@ pytest -q                                    # 运行测试
 ```
 
 测试包含核心算法（选择、预算选择、遮盖、编辑应用、片段迁移）单元测试、
-三个 API 端点的端到端测试，以及各 300 组随机用例下
+脱敏发布凭证（加盐摘要、哈希链重算、篡改检出、SQLite 并发编号一致性）
+单元测试，以及各 API 端点的端到端测试，另含各 300 组随机用例下
 动态规划结果与 2^n 暴力枚举（含带预算版本）的对照校验。
+
+本地运行时凭证数据库默认在工作目录的 `data/redaction.db`，
+可用环境变量 `REDACTION_DB_PATH` 覆盖（容器内固定为 `/data/redaction.db`，
+由命名卷持久化）。
 
 ## 项目结构
 
@@ -325,8 +441,10 @@ pytest -q                                    # 运行测试
 .
 ├── app/
 │   ├── main.py          # FastAPI 路由、请求校验
-│   └── redaction.py     # 区间调度 DP 与遮盖算法（与框架解耦）
+│   ├── redaction.py     # 区间调度 DP 与遮盖算法（与框架解耦）
+│   └── publishing.py    # 脱敏凭证 SQLite 持久化与 SHA-256 哈希链
 ├── tests/               # pytest 测试
+├── data/                # 本地运行默认的 SQLite 目录（容器内为 /data 卷）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
