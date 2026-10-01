@@ -7,6 +7,12 @@
 迁移保留片段，再完成选择与遮盖；以及 `POST /redact/budget`：在给定的
 遮盖码点总预算内选择最优组合。
 
+`POST /redact/publish` 可把脱敏结果作为**发布凭证**持久化：服务只保存
+遮盖正文、入选区间与带随机盐的原文 SHA-256 摘要（**不保存原文**），
+每条凭证带单调递增编号与哈希链值；凭证经 SQLite 持久化到挂载的
+数据卷，重启不丢失。客户端凭发布时返回的链值，可随时通过
+`GET /redact/publish/{id}/verify` 重放哈希链，核验凭证是否被篡改。
+
 ## 一条命令启动
 
 需要 Docker（含 Compose 插件，Docker Desktop 自带），**无需任何外部账号或密钥**：
@@ -23,6 +29,11 @@ docker compose up --build
 - OpenAPI 描述：`http://localhost:8000/openapi.json`
 
 后台运行可加 `-d`，停止使用 `docker compose down`。
+
+发布凭证保存在 Docker 命名卷 `publish-data`（容器内 `/data/publish.db`），
+执行 `docker compose down` 后仍保留；只有显式
+`docker compose down -v` 才会删除。数据库路径可用环境变量
+`REDACT_PUBLISH_DB` 覆盖（非容器化开发时默认为 `./data/publish.db`）。
 
 ## API
 
@@ -296,6 +307,144 @@ curl -s http://localhost:8000/redact/revise \
 删除区间 `[2,4)` 与片段 1（`[1,3)`）相交，片段 1 作废；片段 2（`[4,6)`）
 在删除之后，整体左移 2 个码点至 `[2,4)`，遮盖修订后文本中的 `"ef"`。
 
+### `POST /redact/publish`
+
+按与 `POST /redact` **完全相同的 `text`、`fragments` 校验与选段规则**
+生成遮盖结果，并把它作为一条脱敏发布凭证持久化（SQLite）。
+
+**服务端不保存原文**，每条凭证只持久化：
+
+- 遮盖正文 `masked_text`；
+- 入选区间（每条的 `id` / `start` / `end`）；
+- 带 16 字节随机盐的原文 SHA-256 摘要 `text_digest` 及盐 `salt`
+  （仅持有原文的客户端可自行复算比对，服务端无法据此还原原文）。
+
+每条凭证带：
+
+- 单调递增编号 `id`（从 1 开始）；
+- 链值 `chain_value`：以固定创世链值为起点，
+  `chain_n = SHA256(chain_{n-1} ‖ 规范化凭证内容_n)`；
+  规范化内容包含编号、遮盖正文、入选区间、盐与摘要。
+
+编号分配与链值计算在同一个 SQLite `BEGIN IMMEDIATE` 写事务内完成，
+并发发布请求会被写锁串行化，编号严格连续、链顺序严格一致。
+
+请求体：与 `POST /redact` 相同（仅 `text` 与 `fragments`）。
+
+返回体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 凭证编号（库内单调递增，从 1 开始） |
+| `masked_text` | 遮盖正文（已持久化的公开版本） |
+| `selected_ids` | 入选片段 ID，按升序排列 |
+| `rejected_ids` | 落选片段 ID，按升序排列 |
+| `text_digest` | 带随机盐的原文 SHA-256 摘要（64 位十六进制） |
+| `salt` | 本次摘要的随机盐（32 位十六进制） |
+| `chain_value` | **本凭证链值，客户端必须留存**（64 位十六进制） |
+| `previous_chain_value` | 前一凭证链值（首条为固定创世链值） |
+
+#### 示例
+
+```bash
+curl -s http://localhost:8000/redact/publish \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "你好，世界！",
+    "fragments": [
+      {"id": 1, "weight": 5, "start": 0, "end": 3},
+      {"id": 2, "weight": 3, "start": 0, "end": 2},
+      {"id": 3, "weight": 1, "start": 2, "end": 5}
+    ]
+  }'
+```
+
+响应（链值与摘要每次不同）：
+
+```json
+{
+  "id": 1,
+  "masked_text": "███世界！",
+  "selected_ids": [1],
+  "rejected_ids": [2, 3],
+  "text_digest": "9d2f…（64 位十六进制）",
+  "salt": "1a7c…（32 位十六进制）",
+  "chain_value": "e3b0…（64 位十六进制，请留存）",
+  "previous_chain_value": "36f33a9f…（创世链值）"
+}
+```
+
+#### 凭证留存方式
+
+链值是日后核验的唯一凭据，服务端不会主动告知某条凭证“应当”对应哪个
+链值之外的信息。请在发布方（客户端）至少留存：
+
+1. **`id`（凭证编号）与 `chain_value`（链值）** —— 核验接口的两个必需参数；
+2. 需要时留存 `salt` 与 `text_digest`，以便日后用原文自行复算摘要；
+3. 原文请按自身策略妥善保管，服务端不落盘、无法找回。
+
+可简单存入一行记录，例如：
+
+```text
+id=1  chain=e3b0c44298fc1c149afbf4c8996fb924…  salt=1a7c…  digest=9d2f…
+```
+
+### `GET /redact/publish/{id}/verify`
+
+从固定创世链值出发，**重算截至编号 `id` 的全部凭证**，与库中链值逐一
+比对，并与客户端留存的链值比较。查询参数：
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `chain_value` | string | **必填**，发布时客户端留存的 64 位十六进制链值 |
+
+返回体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 核验目标凭证编号 |
+| `valid` | 链重算全部一致且与 `chain_value` 相符时为 `true` |
+| `first_break_id` | **首个链值断裂的凭证编号**；无断裂为 `null` |
+| `recomputed_chain_value` | 由库中记录重算得到的截至该凭证的链值 |
+| `reason` | 中文核验结论 |
+
+目标编号不存在返回 HTTP 404；`chain_value` 缺失或不是 64 位小写
+十六进制 SHA-256 返回 HTTP 400。
+
+#### 示例
+
+```bash
+curl -s 'http://localhost:8000/redact/publish/1/verify?chain_value=e3b0…'
+```
+
+链完整且与留存值一致：
+
+```json
+{
+  "id": 1,
+  "valid": true,
+  "first_break_id": null,
+  "recomputed_chain_value": "e3b0…",
+  "reason": "核验通过：凭证 1 及其之前的记录完整，链值与客户端留存一致"
+}
+```
+
+若第 2 条凭证（或其之前任何记录）被篡改，再核验到第 3 条：
+
+```json
+{
+  "id": 3,
+  "valid": false,
+  "first_break_id": 2,
+  "recomputed_chain_value": "…",
+  "reason": "核验失败：库中记录与哈希链在凭证 2 处首次断裂，该凭证或更早记录可能被篡改"
+}
+```
+
+若库内链完整但与客户端留存链值不符（例如留存值来自另一条链或已过期），
+`first_break_id` 为 `null`、`valid` 为 `false`，`reason` 会说明
+“与客户端留存的链值不符”。
+
 ## 码点计数说明
 
 位置与遮盖均以 **Unicode 码点**为单位（即 Python 3 中 `str` 的索引与
@@ -316,8 +465,12 @@ pytest -q                                    # 运行测试
 ```
 
 测试包含核心算法（选择、预算选择、遮盖、编辑应用、片段迁移）单元测试、
-三个 API 端点的端到端测试，以及各 300 组随机用例下
+五个 API 端点的端到端测试（含发布凭证的哈希链重放、篡改检测、
+30 路并发下编号连续性与链自洽性），以及各 300 组随机用例下
 动态规划结果与 2^n 暴力枚举（含带预算版本）的对照校验。
+
+非容器化开发时凭证库默认位于 `./data/publish.db`，可用
+`REDACT_PUBLISH_DB` 环境变量指向其他路径。
 
 ## 项目结构
 
@@ -325,10 +478,11 @@ pytest -q                                    # 运行测试
 .
 ├── app/
 │   ├── main.py          # FastAPI 路由、请求校验
-│   └── redaction.py     # 区间调度 DP 与遮盖算法（与框架解耦）
+│   ├── redaction.py     # 区间调度 DP 与遮盖算法（与框架解耦）
+│   └── publish.py       # 发布凭证：盐摘要、哈希链、SQLite 事务存储
 ├── tests/               # pytest 测试
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml   # 命名卷 publish-data → /data（凭证持久化）
 ├── requirements.txt
 └── requirements-dev.txt
 ```

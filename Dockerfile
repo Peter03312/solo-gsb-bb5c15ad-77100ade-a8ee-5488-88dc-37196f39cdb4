@@ -13,10 +13,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 再拷贝应用代码
 COPY app ./app
 
+# 凭证库默认写入 /data/publish.db：目录需对非 root 用户可写，
+# 并由 Compose 挂载持久化命名卷。
+RUN mkdir -p /data
+
 # 以非 root 用户运行
 RUN useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app
+    && chown -R appuser:appuser /app /data
 USER appuser
+
+ENV REDACT_PUBLISH_DB=/data/publish.db
 
 EXPOSE 8000
 

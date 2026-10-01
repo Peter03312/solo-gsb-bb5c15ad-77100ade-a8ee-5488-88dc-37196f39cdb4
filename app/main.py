@@ -5,10 +5,18 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
+from .publish import (
+    digest_original,
+    get_store,
+    selected_intervals,
+)
 from .redaction import (
     Edit,
     Fragment,
@@ -21,12 +29,15 @@ from .redaction import (
 
 app = FastAPI(
     title="敏感片段遮盖 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "提交原文及候选片段（含唯一 ID、正整数权重、左闭右开码点区间），"
         "返回互不重叠的最优入选组合、落选 ID 与等长遮盖文本。"
         "支持按码点区间编辑修订原文：作废旧片段、迁移保留片段后再选择遮盖；"
-        "也支持通过 /redact/budget 限定遮盖码点总预算。"
+        "也支持通过 /redact/budget 限定遮盖码点总预算；"
+        "还支持通过 /redact/publish 发布脱敏凭证：仅持久化遮盖正文、入选区间"
+        "与带随机盐的原文 SHA-256 摘要（不保存原文），凭证带顺序编号与哈希链，"
+        "可经 /redact/publish/{id}/verify 重放核验。"
     ),
 )
 
@@ -182,6 +193,33 @@ class ReviseOut(BaseModel):
         ..., description="保留片段中落选的 ID（升序，不含作废）"
     )
     masked_text: str = Field(..., description="修订后正文中入选片段以等长 █ 遮盖的结果")
+
+
+class PublishOut(BaseModel):
+    id: int = Field(..., description="凭证编号（库内单调递增，从 1 开始）")
+    masked_text: str = Field(..., description="入选片段以等长 █ 遮盖后的正文（已持久化）")
+    selected_ids: list[int | str] = Field(..., description="入选片段 ID（升序）")
+    rejected_ids: list[int | str] = Field(..., description="落选片段 ID（升序）")
+    text_digest: str = Field(
+        ..., description="带随机盐的原文 SHA-256 摘要（十六进制）；原文本身不持久化"
+    )
+    salt: str = Field(..., description="本次摘要使用的随机盐（十六进制）")
+    chain_value: str = Field(..., description="本凭证链值（64 位十六进制 SHA-256），客户端应留存")
+    previous_chain_value: str = Field(
+        ..., description="前一凭证链值；首条凭证为固定创世链值"
+    )
+
+
+class VerifyOut(BaseModel):
+    id: int = Field(..., description="核验目标凭证编号")
+    valid: bool = Field(..., description="链重算一致且与客户端留存链值相符时为 true")
+    first_break_id: int | None = Field(
+        ..., description="首个链值断裂的凭证编号；无断裂时为 null"
+    )
+    recomputed_chain_value: str = Field(
+        ..., description="由库中记录重算得到的截至该凭证的链值"
+    )
+    reason: str = Field(..., description="核验结论的中文说明")
 
 
 def _bad(message: str) -> ValueError:
@@ -474,4 +512,93 @@ async def revise(request: Request) -> ReviseOut:
         selected_ids=list(selected),
         rejected_ids=sorted(f.id for f in kept if f.id not in selected_set),
         masked_text=masked,
+    )
+
+
+@app.post(
+    "/redact/publish",
+    response_model=PublishOut,
+    tags=["发布凭证"],
+    summary="发布脱敏凭证（不保存原文）并追加哈希链",
+    openapi_extra={"requestBody": {"content": {"application/json": {"schema": REDACT_REQUEST_SCHEMA}}}},
+)
+async def publish(request: Request) -> PublishOut:
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise _bad("请求体不是合法的 JSON")
+    # text / fragments 的校验与选段规则与 /redact 完全一致。
+    text, fragments = validate_payload(payload)
+
+    selected = select_fragments(fragments)
+    by_id = {f.id: f for f in fragments}
+    chosen = [by_id[fragment_id] for fragment_id in selected]
+    all_ids = sorted(f.id for f in fragments)
+    masked = mask_text(text, chosen)
+
+    intervals = selected_intervals(chosen)
+    salt_hex, text_digest = digest_original(text)
+
+    # SQLite 即时写事务保证并发请求的编号与链顺序一致；阻塞调用放到线程池。
+    result = await run_in_threadpool(
+        get_store().publish,
+        masked,
+        intervals,
+        salt_hex,
+        text_digest,
+    )
+    return PublishOut(
+        id=result.seq,
+        masked_text=masked,
+        selected_ids=list(selected),
+        rejected_ids=[i for i in all_ids if i not in set(selected)],
+        text_digest=text_digest,
+        salt=salt_hex,
+        chain_value=result.chain,
+        previous_chain_value=result.prev_chain,
+    )
+
+
+_HEX64 = frozenset("0123456789abcdef")
+
+
+@app.get(
+    "/redact/publish/{credential_id}/verify",
+    response_model=VerifyOut,
+    tags=["发布凭证"],
+    summary="重放哈希链核验已发布凭证",
+)
+async def verify_publish(
+    credential_id: int, chain_value: str | None = None
+) -> VerifyOut:
+    if credential_id < 1:
+        raise _bad("凭证编号必须是不小于 1 的整数")
+    if chain_value is None:
+        raise _bad("缺少查询参数 chain_value（发布时返回的链值）")
+    if len(chain_value) != 64 or set(chain_value) - _HEX64:
+        raise _bad("chain_value 必须是发布时返回的 64 位十六进制 SHA-256 链值")
+
+    result = await run_in_threadpool(
+        get_store().verify, credential_id, chain_value.lower()
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"凭证 {credential_id} 不存在")
+
+    if result.first_break_seq is not None:
+        reason = (
+            f"核验失败：库中记录与哈希链在凭证 {result.first_break_seq} 处首次断裂，"
+            "该凭证或更早记录可能被篡改"
+        )
+    elif not result.valid:
+        reason = (
+            f"库中截至凭证 {credential_id} 的哈希链完整一致，但与客户端留存的链值不符"
+        )
+    else:
+        reason = f"核验通过：凭证 {credential_id} 及其之前的记录完整，链值与客户端留存一致"
+    return VerifyOut(
+        id=credential_id,
+        valid=result.valid,
+        first_break_id=result.first_break_seq,
+        recomputed_chain_value=result.recomputed_chain,
+        reason=reason,
     )

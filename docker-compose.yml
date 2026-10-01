@@ -5,6 +5,11 @@ services:
     container_name: sensitive-fragment-redaction
     ports:
       - "8000:8000"
+    environment:
+      # 脱敏发布凭证库位置（SQLite）；挂载到命名卷实现持久化。
+      REDACT_PUBLISH_DB: /data/publish.db
+    volumes:
+      - publish-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); assert json.load(r)['status']=='ok'"]
@@ -12,3 +17,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+volumes:
+  publish-data:
